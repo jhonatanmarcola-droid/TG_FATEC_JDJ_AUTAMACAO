@@ -1,0 +1,459 @@
+/*
+   PROJETO: JDJ LITE - Sistema de Envasadora para Bar / Copos
+   AUTOR: JDJ AUTOMAÇÃO
+   CURSO: Automação Industrial - FATEC Bauru
+   PLACA: ESP32 
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// --- OLED DISPLAY CONFIGURATION ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// --- PINOUT: BUTTONS & INDICATORS ---
+#define LED_DOSING_PIN    2
+#define BUZZER_PIN       15
+
+#define BTN_YELLOW_PIN   25 // Navigation / Menu
+#define BTN_GREEN_PIN    27 // Confirm / Start Dosing
+#define BTN_RED_PIN      14 // Cancel / Abort
+#define BTN_BLACK_PIN    26 // Decrement (-) / Purge Solenoid B
+#define BTN_BLUE_PIN     12 // Increment (+) / Purge Solenoid A
+
+// --- PINOUT: HYDRAULICS & SENSORS ---
+#define SOLENOID_WATER_PIN   18 // Válvula A (ex: Água / Base)
+#define SOLENOID_OIL_PIN     19 // Válvula B (ex: Xarope / Destilado)
+
+#define WATER_FLOW_SENSOR_PIN 32 // Flow Sensor A (YF-S201)
+#define OIL_FLOW_SENSOR_PIN   33 // Flow Sensor B
+
+// Flow Sensor Calibration Factor (Pulses per Liter for YF-S201)
+const float PULSES_PER_LITER = 450.0; 
+
+// Pulse Counters
+volatile unsigned long waterPulseCount = 0;
+volatile unsigned long oilPulseCount = 0;
+
+void IRAM_ATTR countWaterPulses() { waterPulseCount++; }
+void IRAM_ATTR countOilPulses() { oilPulseCount++; }
+
+// --- FINITE STATE MACHINE (FSM) ---
+enum SystemState {
+  STATE_MAIN_SCREEN,
+  STATE_MENU1_TOTAL_VOL,
+  STATE_MENU2_WATER_PCT,
+  STATE_MENU3_PURGE,
+  STATE_DOSING,
+  STATE_DOSING_COMPLETE
+};
+
+SystemState currentState = STATE_MAIN_SCREEN;
+
+// --- INITIAL SYSTEM PARAMETERS ---
+float totalVolume = 0.30;       // Initial Dose: 300 ml (0.30 L)
+float waterPercentage = 80.0;   // 80% Liquido A / 20% Liquido B
+
+// Temporary Variables for Menu Editing
+float tempTotalVolume = 0.30;
+float tempWaterPercentage = 80.0;
+
+// Calculated Targets
+float targetWaterVol = 0.0;
+float targetOilVol = 0.0;
+
+bool isWaterSolenoidActive = false;
+bool isOilSolenoidActive = false;
+
+// Timing & Debounce Controls via millis()
+unsigned long lastButtonDebounce = 0;
+const unsigned long DEBOUNCE_DELAY = 180; // ms
+
+// --- AUDIO FEEDBACK FUNCTIONS ---
+void playSoftSound(int frequency, int durationMs) {
+  tone(BUZZER_PIN, frequency, durationMs);
+  delay(durationMs);
+  noTone(BUZZER_PIN);
+}
+
+void playButtonBeep() {
+  playSoftSound(2200, 15); // Bip curto ao apertar botão
+}
+
+void playStartDosingBeep() {
+  playSoftSound(1500, 120); // Bip leve no arranque do envase
+}
+
+void playCompleteBeep() {
+  playSoftSound(1200, 40); 
+  delay(20);
+  playSoftSound(1600, 60); 
+}
+
+void playCancelBeep() {
+  playSoftSound(600, 150);  
+  delay(30);
+  playSoftSound(400, 200);  
+}
+
+void playStartupBeep() {
+  playSoftSound(1800, 30);
+  delay(30);
+  playSoftSound(2200, 40);
+}
+
+// --- FORWARD DECLARATION OF FUNCTIONS ---
+void processButtons();
+void processDosing();
+void startDosing();
+void stopProcess();
+void updateOLED();
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_DOSING_PIN, OUTPUT);
+  digitalWrite(LED_DOSING_PIN, LOW);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(SOLENOID_WATER_PIN, OUTPUT);
+  pinMode(SOLENOID_OIL_PIN, OUTPUT);
+
+  digitalWrite(SOLENOID_WATER_PIN, LOW);
+  digitalWrite(SOLENOID_OIL_PIN, LOW);
+
+  pinMode(BTN_YELLOW_PIN, INPUT_PULLUP);
+  pinMode(BTN_GREEN_PIN, INPUT_PULLUP);
+  pinMode(BTN_RED_PIN, INPUT_PULLUP);
+  pinMode(BTN_BLACK_PIN, INPUT_PULLUP);
+  pinMode(BTN_BLUE_PIN, INPUT_PULLUP);
+
+  pinMode(WATER_FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(OIL_FLOW_SENSOR_PIN, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(WATER_FLOW_SENSOR_PIN), countWaterPulses, FALLING);
+  attachInterrupt(digitalPinToInterrupt(OIL_FLOW_SENSOR_PIN), countOilPulses, FALLING);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("Erro ao iniciar display OLED!"));
+    for (;;);
+  }
+
+  playStartupBeep();
+  updateOLED();
+}
+
+void loop() {
+  processButtons();
+
+  if (currentState == STATE_DOSING) {
+    processDosing();
+  } else {
+    static unsigned long lastOLEDUpdate = 0;
+    if (millis() - lastOLEDUpdate > 250) {
+      lastOLEDUpdate = millis();
+      updateOLED();
+    }
+  }
+}
+
+void startDosing() {
+  playStartDosingBeep();
+
+  waterPulseCount = 0;
+  oilPulseCount = 0;
+
+  targetWaterVol = totalVolume * (waterPercentage / 100.0);
+  targetOilVol = totalVolume - targetWaterVol;
+
+  isWaterSolenoidActive = (targetWaterVol > 0);
+  isOilSolenoidActive = (targetOilVol > 0);
+
+  digitalWrite(SOLENOID_WATER_PIN, isWaterSolenoidActive ? HIGH : LOW);
+  digitalWrite(SOLENOID_OIL_PIN, isOilSolenoidActive ? HIGH : LOW);
+  digitalWrite(LED_DOSING_PIN, HIGH);
+
+  currentState = STATE_DOSING;
+}
+
+void processDosing() {
+  float currentWaterVol = waterPulseCount / PULSES_PER_LITER;
+  float currentOilVol = oilPulseCount / PULSES_PER_LITER;
+
+  if (isWaterSolenoidActive && currentWaterVol >= targetWaterVol) {
+    digitalWrite(SOLENOID_WATER_PIN, LOW);
+    isWaterSolenoidActive = false;
+  }
+
+  if (isOilSolenoidActive && currentOilVol >= targetOilVol) {
+    digitalWrite(SOLENOID_OIL_PIN, LOW);
+    isOilSolenoidActive = false;
+  }
+
+  // Fim do envase: Ambas as válvulas fecharam via pulso Hall
+  if (!isWaterSolenoidActive && !isOilSolenoidActive) {
+    digitalWrite(SOLENOID_WATER_PIN, LOW);
+    digitalWrite(SOLENOID_OIL_PIN, LOW);
+    digitalWrite(LED_DOSING_PIN, LOW);
+
+    playCompleteBeep();
+    currentState = STATE_DOSING_COMPLETE;
+  }
+
+  updateOLED();
+}
+
+void stopProcess() {
+  digitalWrite(SOLENOID_WATER_PIN, LOW);
+  digitalWrite(SOLENOID_OIL_PIN, LOW);
+  digitalWrite(LED_DOSING_PIN, LOW);
+  noTone(BUZZER_PIN);
+  isWaterSolenoidActive = false;
+  isOilSolenoidActive = false;
+  currentState = STATE_MAIN_SCREEN;
+}
+
+void processButtons() {
+  if ((millis() - lastButtonDebounce) < DEBOUNCE_DELAY) return;
+
+  static bool prevYellowState = HIGH;
+  static bool prevGreenState = HIGH;
+  static bool prevRedState = HIGH;
+  static bool prevBlackState = HIGH;
+  static bool prevBlueState = HIGH;
+
+  bool currentYellowState = digitalRead(BTN_YELLOW_PIN);
+  bool currentGreenState = digitalRead(BTN_GREEN_PIN);
+  bool currentRedState = digitalRead(BTN_RED_PIN);
+  bool currentBlackState = digitalRead(BTN_BLACK_PIN);
+  bool currentBlueState = digitalRead(BTN_BLUE_PIN);
+
+  // BOTÃO AMARELO: Navegação
+  if (currentYellowState == LOW && prevYellowState == HIGH) {
+    lastButtonDebounce = millis();
+    playButtonBeep();
+
+    if (currentState == STATE_MAIN_SCREEN) {
+      tempTotalVolume = totalVolume;
+      tempWaterPercentage = waterPercentage;
+      currentState = STATE_MENU1_TOTAL_VOL;
+    } 
+    else if (currentState == STATE_MENU1_TOTAL_VOL) {
+      currentState = STATE_MENU2_WATER_PCT;
+    }
+    else if (currentState == STATE_MENU2_WATER_PCT) {
+      currentState = STATE_MENU3_PURGE;
+    }
+    else if (currentState == STATE_MENU3_PURGE) {
+      // Salva e retorna à tela principal
+      totalVolume = tempTotalVolume;
+      waterPercentage = tempWaterPercentage;
+      digitalWrite(SOLENOID_WATER_PIN, LOW);
+      digitalWrite(SOLENOID_OIL_PIN, LOW);
+      currentState = STATE_MAIN_SCREEN;
+    }
+    updateOLED();
+  }
+
+  // BOTÃO VERDE: Salvar / Iniciar Envase / Confirmar
+  if (currentGreenState == LOW && prevGreenState == HIGH) {
+    lastButtonDebounce = millis();
+    playButtonBeep();
+
+    if (currentState >= STATE_MENU1_TOTAL_VOL && currentState <= STATE_MENU3_PURGE) {
+      totalVolume = tempTotalVolume;
+      waterPercentage = tempWaterPercentage;
+      digitalWrite(SOLENOID_WATER_PIN, LOW);
+      digitalWrite(SOLENOID_OIL_PIN, LOW);
+      currentState = STATE_MAIN_SCREEN;
+    }
+    else if (currentState == STATE_MAIN_SCREEN) {
+      startDosing();
+    }
+    else if (currentState == STATE_DOSING_COMPLETE) {
+      currentState = STATE_MAIN_SCREEN;
+    }
+    updateOLED();
+  }
+
+  // BOTÃO VERMELHO: Cancelar / Abortar
+  if (currentRedState == LOW && prevRedState == HIGH) {
+    lastButtonDebounce = millis();
+    playCancelBeep();
+
+    if (currentState == STATE_DOSING) {
+      stopProcess();
+    } else {
+      digitalWrite(SOLENOID_WATER_PIN, LOW);
+      digitalWrite(SOLENOID_OIL_PIN, LOW);
+      currentState = STATE_MAIN_SCREEN;
+    }
+    updateOLED();
+  }
+
+  // BOTÃO PRETO: Decrementar (-) OU Purga Solenoide B (Líquido B)
+  if (currentState == STATE_MENU3_PURGE) {
+    if (currentBlackState == LOW) {
+      digitalWrite(SOLENOID_OIL_PIN, HIGH);
+    } else {
+      digitalWrite(SOLENOID_OIL_PIN, LOW);
+    }
+  } 
+  else if (currentBlackState == LOW && prevBlackState == HIGH && currentState != STATE_DOSING && currentState != STATE_DOSING_COMPLETE) {
+    lastButtonDebounce = millis();
+    playButtonBeep();
+
+    if (currentState == STATE_MENU1_TOTAL_VOL) {
+      tempTotalVolume -= 0.05; // Passos de 50 mL
+      if (tempTotalVolume < 0.05) tempTotalVolume = 0.05; // Mínimo 50 mL
+    } 
+    else if (currentState == STATE_MENU2_WATER_PCT) {
+      tempWaterPercentage -= 1.0;
+      if (tempWaterPercentage < 0.0) tempWaterPercentage = 0.0;
+    } 
+    updateOLED();
+  }
+
+  // BOTÃO AZUL: Incremento (+) OU Purga Solenoide A (Líquido A)
+  if (currentState == STATE_MENU3_PURGE) {
+    if (currentBlueState == LOW) {
+      digitalWrite(SOLENOID_WATER_PIN, HIGH);
+    } else {
+      digitalWrite(SOLENOID_WATER_PIN, LOW);
+    }
+  } 
+  else if (currentBlueState == LOW && prevBlueState == HIGH && currentState != STATE_DOSING && currentState != STATE_DOSING_COMPLETE) {
+    lastButtonDebounce = millis();
+    playButtonBeep();
+
+    if (currentState == STATE_MENU1_TOTAL_VOL) {
+      tempTotalVolume += 0.05; // Passos de 50 mL
+      if (tempTotalVolume > 10.0) tempTotalVolume = 10.0; // Máximo 10 Litros
+    } 
+    else if (currentState == STATE_MENU2_WATER_PCT) {
+      tempWaterPercentage += 1.0;
+      if (tempWaterPercentage > 100.0) tempWaterPercentage = 100.0;
+    } 
+    updateOLED();
+  }
+
+  prevYellowState = currentYellowState;
+  prevGreenState = currentGreenState;
+  prevRedState = currentRedState;
+  prevBlackState = currentBlackState;
+  prevBlueState = currentBlueState;
+}
+
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  switch (currentState) {
+    case STATE_MAIN_SCREEN:
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println(F("--- ENVASE LITE ---"));
+      display.setCursor(0, 16);
+      if (totalVolume < 1.0) {
+        display.printf("Dose: %.0f mL\n", totalVolume * 1000.0);
+      } else {
+        display.printf("Dose: %.2f L\n", totalVolume);
+      }
+      display.printf("Liq. A: %.0f%% | Liq. B: %.0f%%\n", waterPercentage, 100.0 - waterPercentage);
+      display.setCursor(0, 42);
+      display.println(F("Posicione o copo"));
+      display.setCursor(0, 54);
+      display.println(F("[VERDE] Envasar"));
+      break;
+
+    case STATE_MENU1_TOTAL_VOL:
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println(F("MENU 1/3: TAMANHO DOSE"));
+      display.setTextSize(2);
+      display.setCursor(10, 20);
+      if (tempTotalVolume < 1.0) {
+        display.printf("%.0f mL", tempTotalVolume * 1000.0);
+      } else {
+        display.printf("%.2f L", tempTotalVolume);
+      }
+      display.setTextSize(1);
+      display.setCursor(0, 44);
+      display.println(F("[-]Preto  [+]Azul"));
+      display.setCursor(0, 55);
+      display.println(F("[VERDE] OK/Sair"));
+      break;
+
+    case STATE_MENU2_WATER_PCT:
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println(F("MENU 2/3: % LIQUIDO A"));
+      display.setTextSize(2);
+      display.setCursor(10, 20);
+      display.printf("%.1f %%", tempWaterPercentage);
+      display.setTextSize(1);
+      display.setCursor(0, 44);
+      display.println(F("[-]Preto  [+]Azul"));
+      display.setCursor(0, 55);
+      display.println(F("[VERDE] OK/Sair"));
+      break;
+
+    case STATE_MENU3_PURGE:
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println(F("MENU 3/3: DESPEJO LIVRE"));
+      display.setCursor(0, 18);
+      display.println(F("Segure p/ Acionar:"));
+      display.setCursor(0, 32);
+      display.println(F("[AZUL]  Solenoide A"));
+      display.setCursor(0, 44);
+      display.println(F("[PRETO] Solenoide B"));
+      display.setCursor(0, 55);
+      display.println(F("[VERDE] Sair"));
+      break;
+
+    case STATE_DOSING: {
+      float currentWaterVol = waterPulseCount / PULSES_PER_LITER;
+      float currentOilVol = oilPulseCount / PULSES_PER_LITER;
+
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println(F("   >>> ENVASANDO <<<   "));
+      display.setCursor(0, 18);
+      
+      if (targetWaterVol < 1.0) display.printf("LIQ A: %.0f / %.0f mL\n", currentWaterVol * 1000.0, targetWaterVol * 1000.0);
+      else display.printf("LIQ A: %.2f / %.2f L\n", currentWaterVol, targetWaterVol);
+
+      if (targetOilVol < 1.0) display.printf("LIQ B: %.0f / %.0f mL\n", currentOilVol * 1000.0, targetOilVol * 1000.0);
+      else display.printf("LIQ B: %.2f / %.2f L\n", currentOilVol, targetOilVol);
+
+      display.setCursor(0, 48);
+      if (isWaterSolenoidActive && isOilSolenoidActive) display.println(F("Solenoides: AMBAS"));
+      else if (isWaterSolenoidActive) display.println(F("Sol: Apenas LIQ A"));
+      else if (isOilSolenoidActive) display.println(F("Sol: Apenas LIQ B"));
+      else display.println(F("Solenoides: FECHADAS"));
+      break;
+    }
+
+    case STATE_DOSING_COMPLETE:
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println(F("-- ENVASE CONCLUIDO --"));
+      display.setTextSize(2);
+      display.setCursor(15, 20);
+      display.println(F("PRONTO!"));
+      display.setTextSize(1);
+      display.setCursor(0, 45);
+      display.println(F("Retire o copo..."));
+      display.setCursor(0, 55);
+      display.println(F("[VERDE] Novo Envase"));
+      break;
+  }
+
+  display.display();
+}
