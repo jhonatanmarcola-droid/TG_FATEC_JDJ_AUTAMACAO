@@ -35,8 +35,6 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define SENSOR_HALL_2 33 // Medidor de Fluxo 2
 
 // --- CALIBRAÇÃO DE FLUXO ---
-// Fator multiplicador. (Ex: se 1 clique/pulso = 1 mL, deixe 1.0)
-// Se seu sensor der 5 pulsos para cada 1 mL, mude para 5.0
 #define PULSOS_POR_ML 1.0 
 
 // --- VARIÁVEIS GLOBAIS ---
@@ -59,7 +57,7 @@ int alvoPulsosS2 = 0;
 int ultimosPulsosS1 = -1; 
 int ultimosPulsosS2 = -1;
 bool dosando = false;
-unsigned long tempoInicioDosagem = 0; // Trava contra cancelamento fantasma
+unsigned long tempoInicioDosagem = 0; 
 
 // --- PROTÓTIPOS ---
 void IRAM_ATTR contaPulsoS1();
@@ -80,7 +78,6 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(OLED_SDA, OLED_SCL);
 
-  // Configuração dos Pinos (Botões e Sensores em PULLUP interno)
   pinMode(BTN_AMARELO, INPUT_PULLUP);
   pinMode(BTN_PRETO, INPUT_PULLUP);
   pinMode(BTN_VERDE, INPUT_PULLUP);
@@ -89,22 +86,18 @@ void setup() {
   pinMode(SENSOR_HALL_1, INPUT_PULLUP);
   pinMode(SENSOR_HALL_2, INPUT_PULLUP);
 
-  // Saídas
   pinMode(LED_VERDE, OUTPUT);
   pinMode(BUZZER, OUTPUT);
   pinMode(SOLENOIDE_1, OUTPUT);
   pinMode(SOLENOIDE_2, OUTPUT);
 
-  // Garante válvulas fechadas na partida
   digitalWrite(LED_VERDE, LOW);
   digitalWrite(SOLENOIDE_1, LOW);
   digitalWrite(SOLENOIDE_2, LOW);
 
-  // Interrupções para os sensores Hall
   attachInterrupt(digitalPinToInterrupt(SENSOR_HALL_1), contaPulsoS1, FALLING);
   attachInterrupt(digitalPinToInterrupt(SENSOR_HALL_2), contaPulsoS2, FALLING);
 
-  // Inicialização do OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("Falha ao iniciar OLED"));
     while (1);
@@ -114,7 +107,7 @@ void setup() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(25, 20);
-  display.println(F("JDJ PRO v3.5"));
+  display.println(F("JDJ PRO v3.6"));
   display.setCursor(15, 40);
   display.println(F("Sistema Pronto"));
   display.display();
@@ -133,11 +126,10 @@ void loop() {
   }
 }
 
-// --- FILTRO DE RUÍDO (DEBOUNCE) EM MICROSEGUNDOS ---
+//--- FILTRO DE RUÍDO MAIS RÁPIDO PARA OS SENSORES ---
 void IRAM_ATTR contaPulsoS1() {
   unsigned long tempoAtual = micros();
-  // Trava de 25000 microssegundos (25ms) entre pulsos para evitar clique duplo/ruído
-  if (dosando && (tempoAtual - ultimoPulsoS1 > 25000)) { 
+  if (dosando && (tempoAtual - ultimoPulsoS1 > 100)) { 
     pulsosS1++;
     ultimoPulsoS1 = tempoAtual;
   }
@@ -145,7 +137,7 @@ void IRAM_ATTR contaPulsoS1() {
 
 void IRAM_ATTR contaPulsoS2() {
   unsigned long tempoAtual = micros();
-  if (dosando && (tempoAtual - ultimoPulsoS2 > 25000)) { 
+  if (dosando && (tempoAtual - ultimoPulsoS2 > 100)) { 
     pulsosS2++;
     ultimoPulsoS2 = tempoAtual;
   }
@@ -168,7 +160,7 @@ void tratarBotoesMenu() {
   // Botão VERMELHO: Cancela edições de menu
   if (digitalRead(BTN_VERMELHO) == LOW) {
     if (menuIndex > 0) { 
-      bipCancela();
+      bipSutil(); // Agora apita suavemente no menu, igual aos outros
       tempVolume = volumeTotal;
       tempPercAgua = percAgua;
       menuIndex = 0;
@@ -180,7 +172,7 @@ void tratarBotoesMenu() {
   if (digitalRead(BTN_VERDE) == LOW) {
     bipSutil();
     if (menuIndex == 0) {
-      iniciarCiclo(); // INICIA A DOSAGEM
+      iniciarCiclo(); 
     } else {
       volumeTotal = tempVolume;
       percAgua = tempPercAgua;
@@ -198,7 +190,7 @@ void tratarBotoesMenu() {
     if (digitalRead(BTN_AZUL) == LOW && tempPercAgua < 100) { tempPercAgua += 5; bipSutil(); delay(150); }
     if (digitalRead(BTN_PRETO) == LOW && tempPercAgua > 0) { tempPercAgua -= 5; bipSutil(); delay(150); }
   } 
-  else if (menuIndex == 3) { // PURGA MANUAL
+  else if (menuIndex == 3) { 
     digitalWrite(SOLENOIDE_1, (digitalRead(BTN_PRETO) == LOW) ? HIGH : LOW);
     digitalWrite(SOLENOIDE_2, (digitalRead(BTN_AZUL) == LOW) ? HIGH : LOW);
   } 
@@ -212,8 +204,6 @@ void tratarBotoesMenu() {
 void iniciarCiclo() {
   bipIniciar();
   
-  // TRAVA DE DEDO: Obriga o usuário a soltar o botão Verde antes de iniciar de verdade
-  // Isso impede que um "quique" elétrico atravesse o circuito.
   while(digitalRead(BTN_VERDE) == LOW) { delay(10); }
   delay(50); 
 
@@ -222,9 +212,8 @@ void iniciarCiclo() {
   pulsosS2 = 0;
   ultimosPulsosS1 = -1; 
   ultimosPulsosS2 = -1;
-  tempoInicioDosagem = millis(); // Marca o momento exato que iniciou
+  tempoInicioDosagem = millis(); 
   
-  // Calcula a cota de cada válvula considerando o Fator de Calibração
   float volAgua = volumeTotal * (percAgua / 100.0);
   float volMistura = volumeTotal - volAgua;
   
@@ -237,9 +226,7 @@ void iniciarCiclo() {
 }
 
 void executarDosagem() {
-  // TRAVA DE SEGURANÇA NO CANCELAMENTO: 
-  // O botão vermelho só tem permissão para cancelar após 500ms do inicio. 
-  // Isso mata aquele encerramento "fantasma" que ocorria antes da hora.
+  // Botão VERMELHO: Cancelamento real da dosagem (aqui ele dá o bipe longo)
   if (digitalRead(BTN_VERMELHO) == LOW && (millis() - tempoInicioDosagem > 500)) {
     pararAtuadores();
     bipCancela();
@@ -248,11 +235,9 @@ void executarDosagem() {
     return;
   }
 
-  // Verifica metas individuais e fecha válvulas de forma independente
   if (pulsosS1 >= alvoPulsosS1) digitalWrite(SOLENOIDE_1, LOW);
   if (pulsosS2 >= alvoPulsosS2) digitalWrite(SOLENOIDE_2, LOW);
 
-  // Conclusão total do processo
   if (pulsosS1 >= alvoPulsosS1 && pulsosS2 >= alvoPulsosS2) {
     pararAtuadores();
     bipSucesso();
@@ -260,7 +245,6 @@ void executarDosagem() {
     return;
   }
 
-  // Atualiza o Display apenas quando um pulso novo é computado
   if (pulsosS1 != ultimosPulsosS1 || pulsosS2 != ultimosPulsosS2) {
     display.clearDisplay();
     display.setTextSize(1);
