@@ -1,8 +1,8 @@
 /*
-   PROJETO: JDJ LITE - Sistema de Envasadora Automática
-   AUTOR: JDJ AUTOMAÇÃO
-   CURSO: Automação Industrial - FATEC Bauru
-   PLACA: ESP32 
+   PROJETO: JDJ PRO - Sistema de Envasadora Automática
+   AUTOR: Jhonatan Duarte Marçola
+   CURSO: Tecnologia em Automação Industrial - FATEC Bauru
+   PLACA: ESP32
 */
 
 #include <Wire.h>
@@ -15,336 +15,326 @@
 #define OLED_RESET    -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-#define BTN_INC       12  // Botão Incrementar (+) / Purga Solenoide A
-#define BTN_DEC       13  // Botão Decrementar (-) / Purga Solenoide B
-#define BTN_OK        14  // Botão Navegação / Confirmar
-#define SENSOR_NIVEL  27  // Sensor de Nível de Líquido
-#define SOLENOIDE_A   26  // Válvula Solenoide A (Bico Principal)
-#define SOLENOIDE_B   25  // Válvula Solenoide B (Purga / Auxiliar)
-#define BUZZER        32  // Buzzer para Avisos Sonoros
+// Pinos de Interface (I2C)
+#define OLED_SDA      21
+#define OLED_SCL      22
+
+// Pinos de Controle (Botões)
+#define BTN_AMARELO   25 // Menu (Avança/Salva no final)
+#define BTN_PRETO     26 // Decremento / Purga Solenoide 1
+#define BTN_VERDE     27 // Confirma Menu / Inicia Dosagem
+#define BTN_VERMELHO  14 // Cancela Menu / Cancela Dosagem
+#define BTN_AZUL      12 // Incremento / Purga Solenoide 2
+
+// Pinos de Atuadores e Sensores
+#define LED_VERDE     3  // Indicador de Dosagem
+#define BUZZER        15 // Avisos Sonoros
+#define SOLENOIDE_1   18 // Válvula 1 (Água - Fio Branco)
+#define SOLENOIDE_2   19 // Válvula 2 (Líquido 2)
+#define SENSOR_HALL_1 32 // Medidor de Fluxo 1
+#define SENSOR_HALL_2 33 // Medidor de Fluxo 2
+
+// --- CALIBRAÇÃO DE FLUXO ---
+// Fator multiplicador. (Ex: se 1 clique/pulso = 1 mL, deixe 1.0)
+// Se seu sensor der 5 pulsos para cada 1 mL, mude para 5.0
+#define PULSOS_POR_ML 1.0 
 
 // --- VARIÁVEIS GLOBAIS ---
-int menuIndex = 0;             // Navegação do menu: 0 (Pronto), 1 (Volume), 2 (Tempo), 3 (Purga)
-int volumeDesejado = 250;      // Volume alvo em mL
-int tempoEnvaseMs = 1500;      // Tempo de abertura da solenoide (ms)
-bool emProcesso = false;       // Flag de estado do processo
+int menuIndex = 0;             
+int volumeTotal = 250;         
+int percAgua = 50;             
 
-// Variáveis temporárias para edição de parâmetros
-int tempVolumeDesejado = 250;
-int tempTempoEnvaseMs = 1500;
+// Variáveis temporárias para edição nos menus
+int tempVolume = 250;
+int tempPercAgua = 50;
 
-// Controle de Debounce
-unsigned long ultimoDebounce = 0;
-const unsigned long DEBOUNCE_DELAY = 180; // ms
+// Controle de Processo
+volatile int pulsosS1 = 0;
+volatile int pulsosS2 = 0;
+volatile unsigned long ultimoPulsoS1 = 0;
+volatile unsigned long ultimoPulsoS2 = 0;
 
-// --- FUNÇÕES DE ÁUDIO (BIPS BEM LEVES E SUTIS) ---
-void tocarSomSuave(int frequencia, int duracaoMs) {
-  tone(BUZZER, frequencia, duracaoMs);
-  delay(duracaoMs);
-  noTone(BUZZER);
-}
+int alvoPulsosS1 = 0;
+int alvoPulsosS2 = 0;
+int ultimosPulsosS1 = -1; 
+int ultimosPulsosS2 = -1;
+bool dosando = false;
+unsigned long tempoInicioDosagem = 0; // Trava contra cancelamento fantasma
 
-void bipBotao() {
-  tocarSomSuave(2200, 15); // Bip ultra curto e leve ao apertar botão
-}
-
-void bipInicioEnvase() {
-  tocarSomSuave(1500, 100); // Som leve na abertura do bico
-}
-
-void bipSucesso() {
-  tocarSomSuave(1200, 40);
-  delay(20);
-  tocarSomSuave(1600, 60);
-}
-
-void bipInicializacao() {
-  tocarSomSuave(1800, 30);
-  delay(30);
-  tocarSomSuave(2200, 40);
-}
-
-// --- PROTÓTIPOS DE FUNÇÕES ---
-void tratarErroNivel();
-void processarBotoes();
-void atualizarDisplayMenu();
-void executarEnvase();
-void tratarFinalizacao();
+// --- PROTÓTIPOS ---
+void IRAM_ATTR contaPulsoS1();
+void IRAM_ATTR contaPulsoS2();
+void bipSutil();
+void bipLigar();
+void bipIniciar();
+void bipSucesso();
+void bipCancela();
+void tratarBotoesMenu();
+void iniciarCiclo();
+void executarDosagem();
+void pararAtuadores();
+void atualizarDisplay();
 
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
+  Wire.begin(OLED_SDA, OLED_SCL);
 
-  // Inicializa I2C
-  Wire.begin(21, 22);
+  // Configuração dos Pinos (Botões e Sensores em PULLUP interno)
+  pinMode(BTN_AMARELO, INPUT_PULLUP);
+  pinMode(BTN_PRETO, INPUT_PULLUP);
+  pinMode(BTN_VERDE, INPUT_PULLUP);
+  pinMode(BTN_VERMELHO, INPUT_PULLUP);
+  pinMode(BTN_AZUL, INPUT_PULLUP);
+  pinMode(SENSOR_HALL_1, INPUT_PULLUP);
+  pinMode(SENSOR_HALL_2, INPUT_PULLUP);
 
-  // Configuração dos Pinos
-  pinMode(BTN_INC, INPUT_PULLUP);
-  pinMode(BTN_DEC, INPUT_PULLUP);
-  pinMode(BTN_OK, INPUT_PULLUP);
-  pinMode(SENSOR_NIVEL, INPUT_PULLUP);
-
-  pinMode(SOLENOIDE_A, OUTPUT);
-  pinMode(SOLENOIDE_B, OUTPUT);
+  // Saídas
+  pinMode(LED_VERDE, OUTPUT);
   pinMode(BUZZER, OUTPUT);
+  pinMode(SOLENOIDE_1, OUTPUT);
+  pinMode(SOLENOIDE_2, OUTPUT);
 
-  digitalWrite(SOLENOIDE_A, LOW);
-  digitalWrite(SOLENOIDE_B, LOW);
-  digitalWrite(BUZZER, LOW);
+  // Garante válvulas fechadas na partida
+  digitalWrite(LED_VERDE, LOW);
+  digitalWrite(SOLENOIDE_1, LOW);
+  digitalWrite(SOLENOIDE_2, LOW);
 
-  // Inicialização do Display OLED
+  // Interrupções para os sensores Hall
+  attachInterrupt(digitalPinToInterrupt(SENSOR_HALL_1), contaPulsoS1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(SENSOR_HALL_2), contaPulsoS2, FALLING);
+
+  // Inicialização do OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("Erro ao inicializar o Display SSD1306!"));
-    while (1) { delay(100); }
+    Serial.println(F("Falha ao iniciar OLED"));
+    while (1);
   }
-
-  bipInicializacao();
 
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  display.setCursor(20, 20);
-  display.println(F("JDJ LITE v2.0"));
+  display.setCursor(25, 20);
+  display.println(F("JDJ PRO v3.5"));
   display.setCursor(15, 40);
-  display.println(F("Iniciando Sistema..."));
+  display.println(F("Sistema Pronto"));
   display.display();
 
-  delay(1200);
-  atualizarDisplayMenu();
+  bipLigar();
+  delay(1500);
 }
 
 // --- LOOP PRINCIPAL ---
 void loop() {
-  // Verificação simples do nível de reservatório
-  if (digitalRead(SENSOR_NIVEL) == LOW) {
-    tratarErroNivel();
+  if (dosando) {
+    executarDosagem();
+  } else {
+    tratarBotoesMenu();
+    atualizarDisplay();
+  }
+}
+
+// --- FILTRO DE RUÍDO (DEBOUNCE) EM MICROSEGUNDOS ---
+void IRAM_ATTR contaPulsoS1() {
+  unsigned long tempoAtual = micros();
+  // Trava de 25000 microssegundos (25ms) entre pulsos para evitar clique duplo/ruído
+  if (dosando && (tempoAtual - ultimoPulsoS1 > 25000)) { 
+    pulsosS1++;
+    ultimoPulsoS1 = tempoAtual;
+  }
+}
+
+void IRAM_ATTR contaPulsoS2() {
+  unsigned long tempoAtual = micros();
+  if (dosando && (tempoAtual - ultimoPulsoS2 > 25000)) { 
+    pulsosS2++;
+    ultimoPulsoS2 = tempoAtual;
+  }
+}
+
+// --- GERENCIAMENTO DE MENUS ---
+void tratarBotoesMenu() {
+  // Botão AMARELO: Navega menus e salva
+  if (digitalRead(BTN_AMARELO) == LOW) {
+    bipSutil();
+    menuIndex++;
+    if (menuIndex > 3) {
+      volumeTotal = tempVolume;
+      percAgua = tempPercAgua;
+      menuIndex = 0;
+    }
+    delay(250); 
+  }
+
+  // Botão VERMELHO: Cancela edições de menu
+  if (digitalRead(BTN_VERMELHO) == LOW) {
+    if (menuIndex > 0) { 
+      bipCancela();
+      tempVolume = volumeTotal;
+      tempPercAgua = percAgua;
+      menuIndex = 0;
+      delay(250);
+    }
+  }
+
+  // Botão VERDE: Confirma Menu / Inicia Processo
+  if (digitalRead(BTN_VERDE) == LOW) {
+    bipSutil();
+    if (menuIndex == 0) {
+      iniciarCiclo(); // INICIA A DOSAGEM
+    } else {
+      volumeTotal = tempVolume;
+      percAgua = tempPercAgua;
+      menuIndex = 0;
+      delay(250);
+    }
+  }
+
+  // Botões AZUL (+) e PRETO (-)
+  if (menuIndex == 1) { 
+    if (digitalRead(BTN_AZUL) == LOW) { tempVolume += 10; bipSutil(); delay(150); }
+    if (digitalRead(BTN_PRETO) == LOW && tempVolume > 10) { tempVolume -= 10; bipSutil(); delay(150); }
+  } 
+  else if (menuIndex == 2) { 
+    if (digitalRead(BTN_AZUL) == LOW && tempPercAgua < 100) { tempPercAgua += 5; bipSutil(); delay(150); }
+    if (digitalRead(BTN_PRETO) == LOW && tempPercAgua > 0) { tempPercAgua -= 5; bipSutil(); delay(150); }
+  } 
+  else if (menuIndex == 3) { // PURGA MANUAL
+    digitalWrite(SOLENOIDE_1, (digitalRead(BTN_PRETO) == LOW) ? HIGH : LOW);
+    digitalWrite(SOLENOIDE_2, (digitalRead(BTN_AZUL) == LOW) ? HIGH : LOW);
+  } 
+  else {
+    digitalWrite(SOLENOIDE_1, LOW);
+    digitalWrite(SOLENOIDE_2, LOW);
+  }
+}
+
+// --- CICLO DE DOSAGEM ---
+void iniciarCiclo() {
+  bipIniciar();
+  
+  // TRAVA DE DEDO: Obriga o usuário a soltar o botão Verde antes de iniciar de verdade
+  // Isso impede que um "quique" elétrico atravesse o circuito.
+  while(digitalRead(BTN_VERDE) == LOW) { delay(10); }
+  delay(50); 
+
+  dosando = true;
+  pulsosS1 = 0;
+  pulsosS2 = 0;
+  ultimosPulsosS1 = -1; 
+  ultimosPulsosS2 = -1;
+  tempoInicioDosagem = millis(); // Marca o momento exato que iniciou
+  
+  // Calcula a cota de cada válvula considerando o Fator de Calibração
+  float volAgua = volumeTotal * (percAgua / 100.0);
+  float volMistura = volumeTotal - volAgua;
+  
+  alvoPulsosS1 = volAgua * PULSOS_POR_ML;
+  alvoPulsosS2 = volMistura * PULSOS_POR_ML;
+
+  digitalWrite(LED_VERDE, HIGH);
+  if (alvoPulsosS1 > 0) digitalWrite(SOLENOIDE_1, HIGH);
+  if (alvoPulsosS2 > 0) digitalWrite(SOLENOIDE_2, HIGH);
+}
+
+void executarDosagem() {
+  // TRAVA DE SEGURANÇA NO CANCELAMENTO: 
+  // O botão vermelho só tem permissão para cancelar após 500ms do inicio. 
+  // Isso mata aquele encerramento "fantasma" que ocorria antes da hora.
+  if (digitalRead(BTN_VERMELHO) == LOW && (millis() - tempoInicioDosagem > 500)) {
+    pararAtuadores();
+    bipCancela();
+    dosando = false;
+    delay(300);
     return;
   }
 
-  processarBotoes();
+  // Verifica metas individuais e fecha válvulas de forma independente
+  if (pulsosS1 >= alvoPulsosS1) digitalWrite(SOLENOIDE_1, LOW);
+  if (pulsosS2 >= alvoPulsosS2) digitalWrite(SOLENOIDE_2, LOW);
 
-  if (!emProcesso) {
-    static unsigned long ultimaAtualizacao = 0;
-    if (millis() - ultimaAtualizacao > 200) {
-      ultimaAtualizacao = millis();
-      atualizarDisplayMenu();
-    }
+  // Conclusão total do processo
+  if (pulsosS1 >= alvoPulsosS1 && pulsosS2 >= alvoPulsosS2) {
+    pararAtuadores();
+    bipSucesso();
+    dosando = false;
+    return;
+  }
+
+  // Atualiza o Display apenas quando um pulso novo é computado
+  if (pulsosS1 != ultimosPulsosS1 || pulsosS2 != ultimosPulsosS2) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(20, 0);
+    display.println(F("--- DOSANDO ---"));
+    
+    display.setCursor(0, 20);
+    display.print(F("Agua: ")); display.print(pulsosS1); display.print(F(" / ")); display.print(alvoPulsosS1);
+    
+    display.setCursor(0, 35);
+    display.print(F("Mist: ")); display.print(pulsosS2); display.print(F(" / ")); display.print(alvoPulsosS2);
+    
+    display.setCursor(0, 52);
+    display.println(F("[VM] Cancelar Fluxo"));
+    display.display();
+    
+    ultimosPulsosS1 = pulsosS1;
+    ultimosPulsosS2 = pulsosS2;
   }
 }
 
-// --- PROCESSAMENTO DE BOTÕES E NAVEGAÇÃO ---
-void processarBotoes() {
-  if ((millis() - ultimoDebounce) < DEBOUNCE_DELAY) return;
+void pararAtuadores() {
+  digitalWrite(SOLENOIDE_1, LOW);
+  digitalWrite(SOLENOIDE_2, LOW);
+  digitalWrite(LED_VERDE, LOW);
+}
 
-  static bool prevOkState = HIGH;
-  static bool prevIncState = HIGH;
-  static bool prevDecState = HIGH;
+// --- ATUALIZAÇÃO DO DISPLAY OLED (MENUS) ---
+void atualizarDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
 
-  bool currentOkState = digitalRead(BTN_OK);
-  bool currentIncState = digitalRead(BTN_INC);
-  bool currentDecState = digitalRead(BTN_DEC);
-
-  // BOTÃO OK: Navegação entre os 3 Menus
-  if (currentOkState == LOW && prevOkState == HIGH) {
-    ultimoDebounce = millis();
-    bipBotao();
-
-    if (menuIndex == 0) {
-      tempVolumeDesejado = volumeDesejado;
-      tempTempoEnvaseMs = tempoEnvaseMs;
-      menuIndex = 1;
-    } 
-    else if (menuIndex == 1) {
-      menuIndex = 2;
-    } 
-    else if (menuIndex == 2) {
-      menuIndex = 3;
-    } 
-    else if (menuIndex == 3) {
-      // Salva alterações e retorna à Tela Principal (Pronto)
-      volumeDesejado = tempVolumeDesejado;
-      tempoEnvaseMs = tempTempoEnvaseMs;
-      digitalWrite(SOLENOIDE_A, LOW);
-      digitalWrite(SOLENOIDE_B, LOW);
-      menuIndex = 0;
-    }
-    atualizarDisplayMenu();
-  }
-
-  // AÇÕES NA TELA PRINCIPAL (PRONTO)
   if (menuIndex == 0) {
-    if (currentIncState == LOW && prevIncState == HIGH && !emProcesso) {
-      ultimoDebounce = millis();
-      executarEnvase();
-    }
-  }
-
-  // AÇÕES NO MENU 1: AJUSTE DE VOLUME
+    display.println(F("--- JDJ PRO: PRONTO ---"));
+    display.setCursor(0, 20);
+    display.print(F("Volume: ")); display.print(volumeTotal); display.println(F(" mL"));
+    display.print(F("Agua S1: ")); display.print(percAgua); display.println(F(" %"));
+    display.setCursor(0, 52);
+    display.println(F("[VD] Iniciar Dosagem"));
+  } 
   else if (menuIndex == 1) {
-    if (currentIncState == LOW && prevIncState == HIGH) {
-      ultimoDebounce = millis();
-      bipBotao();
-      tempVolumeDesejado += 10;
-      if (tempVolumeDesejado > 5000) tempVolumeDesejado = 5000;
-      atualizarDisplayMenu();
-    }
-    if (currentDecState == LOW && prevDecState == HIGH) {
-      ultimoDebounce = millis();
-      bipBotao();
-      tempVolumeDesejado -= 10;
-      if (tempVolumeDesejado < 10) tempVolumeDesejado = 10;
-      atualizarDisplayMenu();
-    }
-  }
-
-  // AÇÕES NO MENU 2: AJUSTE DE TEMPO DE ENVASE
+    display.println(F("MENU [1]: VOLUME TOTAL"));
+    display.setTextSize(2);
+    display.setCursor(15, 25);
+    display.print(tempVolume); display.println(F(" mL"));
+  } 
   else if (menuIndex == 2) {
-    if (currentIncState == LOW && prevIncState == HIGH) {
-      ultimoDebounce = millis();
-      bipBotao();
-      tempTempoEnvaseMs += 100;
-      if (tempTempoEnvaseMs > 60000) tempTempoEnvaseMs = 60000;
-      atualizarDisplayMenu();
-    }
-    if (currentDecState == LOW && prevDecState == HIGH) {
-      ultimoDebounce = millis();
-      bipBotao();
-      tempTempoEnvaseMs -= 100;
-      if (tempTempoEnvaseMs < 100) tempTempoEnvaseMs = 100;
-      atualizarDisplayMenu();
-    }
-  }
-
-  // AÇÕES NO MENU 3: DESPEJO LIVRE / PURGA MANUAL
+    display.println(F("MENU [2]: MISTURA AGUA"));
+    display.setTextSize(2);
+    display.setCursor(25, 25);
+    display.print(tempPercAgua); display.println(F(" %"));
+  } 
   else if (menuIndex == 3) {
-    if (currentIncState == LOW) {
-      digitalWrite(SOLENOIDE_A, HIGH);
-    } else {
-      digitalWrite(SOLENOIDE_A, LOW);
-    }
-
-    if (currentDecState == LOW) {
-      digitalWrite(SOLENOIDE_B, HIGH);
-    } else {
-      digitalWrite(SOLENOIDE_B, LOW);
-    }
+    display.println(F("MENU [3]: DESPEJO"));
+    display.setCursor(0, 25);
+    display.println(F("Segure para Purga:"));
+    display.setCursor(0, 40);
+    display.println(F("[PR] Solenoide 1 (Ag)"));
+    display.println(F("[AZ] Solenoide 2"));
   }
 
-  prevOkState = currentOkState;
-  prevIncState = currentIncState;
-  prevDecState = currentDecState;
-}
-
-// --- ATUALIZAÇÃO DO DISPLAY OLED ---
-void atualizarDisplayMenu() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-
-  switch (menuIndex) {
-    case 0:
-      display.println(F("--- JDJ LITE: PRONTO ---"));
-      display.setCursor(0, 20);
-      display.printf("Vol Alvo: %d mL\n", volumeDesejado);
-      display.printf("Tempo: %.1f s\n", tempoEnvaseMs / 1000.0);
-      display.setCursor(0, 52);
-      display.println(F("[+] INICIAR ENVASE"));
-      break;
-
-    case 1:
-      display.println(F("MENU 1/3: VOLUME ALVO"));
-      display.setTextSize(2);
-      display.setCursor(15, 22);
-      display.printf("%d mL", tempVolumeDesejado);
-      display.setTextSize(1);
-      display.setCursor(0, 44);
-      display.println(F("[-]Dec  [+]Inc"));
-      display.setCursor(0, 55);
-      display.println(F("[OK] Proximo"));
-      break;
-
-    case 2:
-      display.println(F("MENU 2/3: TEMPO ENVASE"));
-      display.setTextSize(2);
-      display.setCursor(15, 22);
-      display.printf("%d ms", tempTempoEnvaseMs);
-      display.setTextSize(1);
-      display.setCursor(0, 44);
-      display.println(F("[-]Dec  [+]Inc"));
-      display.setCursor(0, 55);
-      display.println(F("[OK] Proximo"));
-      break;
-
-    case 3:
-      display.println(F("MENU 3/3: DESPEJO LIVRE"));
-      display.setCursor(0, 18);
-      display.println(F("Segure p/ Acionar:"));
-      display.setCursor(0, 32);
-      display.println(F("[+] Bico Solenoide A"));
-      display.setCursor(0, 44);
-      display.println(F("[-] Bico Solenoide B"));
-      display.setCursor(0, 55);
-      display.println(F("[OK] Salvar e Sair"));
-      break;
+  if (menuIndex == 1 || menuIndex == 2) {
+    display.setTextSize(1);
+    display.setCursor(0, 52);
+    display.println(F("[AZ]+ [PR]- [VD]Salva"));
   }
 
   display.display();
 }
 
-// --- CICLO DE ENVASE ---
-void executarEnvase() {
-  emProcesso = true;
-  bipInicioEnvase();
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println(F("  >>> ENVASANDO... <<<  "));
-  display.setCursor(0, 22);
-  display.printf("Volume: %d mL\n", volumeDesejado);
-  display.setCursor(0, 45);
-  display.println(F("Solenoide A: ATIVA"));
-  display.display();
-
-  // Aciona o bico (Solenoide A) pelo tempo configurado
-  digitalWrite(SOLENOIDE_A, HIGH);
-  delay(tempoEnvaseMs);
-  digitalWrite(SOLENOIDE_A, LOW);
-
-  tratarFinalizacao();
-  emProcesso = false;
-}
-
-// --- TRATAMENTO DE NIVEL BAIXO ---
-void tratarErroNivel() {
-  digitalWrite(SOLENOIDE_A, LOW);
-  digitalWrite(SOLENOIDE_B, LOW);
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(5, 10);
-  display.println(F("! ALARME DE NIVEL !"));
-  display.setCursor(0, 28);
-  display.println(F("Reservatorio Vazio"));
-  display.println(F("Abasteca o sistema..."));
-  display.display();
-
-  tocarSomSuave(800, 80);
-  delay(150);
-}
-
-// --- TRATAMENTO DE FINALIZAÇÃO ---
-void tratarFinalizacao() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(10, 20);
-  display.println(F("ENVASE CONCLUIDO!"));
-  display.setCursor(15, 40);
-  display.println(F("Ciclo Finalizado"));
-  display.display();
-
-  bipSucesso();
-  delay(1200);
-  atualizarDisplayMenu();
-}
+// --- AVISOS SONOROS (BUZZER) ---
+void bipSutil() { tone(BUZZER, 600, 20); delay(20); }
+void bipLigar() { tone(BUZZER, 800, 100); delay(100); tone(BUZZER, 1200, 100); delay(100); tone(BUZZER, 1600, 150); delay(150); }
+void bipIniciar() { tone(BUZZER, 1000, 80); delay(80); }
+void bipSucesso() { tone(BUZZER, 1400, 100); delay(100); tone(BUZZER, 1800, 200); delay(200); }
+void bipCancela() { tone(BUZZER, 400, 300); delay(300); }
