@@ -25,14 +25,18 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define BTN_BLUE_PIN     12 // Increment (+) / Purge Solenoid A (Water) / Unlock Tech Menu
 
 // --- PINOUT: HYDRAULICS, MOTOR & SENSORS ---
-#define SOLENOID_WATER_PIN   18
-#define SOLENOID_OIL_PIN     19
-#define MOTOR_PWM_PIN         5 // MOSFET Driver for Mixer Motor (PWM)
+#define SOLENOID_WATER_PIN      18
+#define SOLENOID_OIL_PIN        19
+#define SOLENOID_DISPENSE_PIN   23 // Solenóide de Saída/Envase do produto misturado
+#define MOTOR_PWM_PIN            5 // MOSFET Driver for Mixer Motor (PWM)
 
-#define FLOAT_SWITCH_PIN      4 // Safety High Level Switch
-#define WATER_FLOW_SENSOR_PIN 32 // Water Flow Sensor (YF-S201)
-#define OIL_FLOW_SENSOR_PIN   33 // Oil Flow Sensor
-#define BRIX_SENSOR_PIN       34 // Brix Sensor / Potentiometer (ADC)
+#define FLOAT_SWITCH_HIGH_PIN    4 // Sensor Boia 1 (Nível Alto / Segurança de transbordamento)
+#define FLOAT_SWITCH_LOW_PIN    17 // NOVO: Sensor Boia 2 (Nível Baixo / Tanque Vazio)
+
+#define WATER_FLOW_SENSOR_PIN   32 // Sensor Fluxo de Água
+#define OIL_FLOW_SENSOR_PIN     33 // Sensor Fluxo de Óleo
+#define OUT_FLOW_SENSOR_PIN     16 // NOVO: Sensor Fluxo de Saída (Envase)
+#define BRIX_SENSOR_PIN         34 // Brix Sensor / Potentiometer (ADC)
 
 // --- MOTOR PWM CONFIGURATION (ESP32) ---
 const int PWM_FREQ = 5000;       // 5 kHz frequency for DC motor
@@ -45,22 +49,25 @@ const float PULSES_PER_LITER = 450.0;
 // Pulse Counters
 volatile unsigned long waterPulseCount = 0;
 volatile unsigned long oilPulseCount = 0;
+volatile unsigned long outPulseCount = 0; // NOVO: Contador da saída
 
 void IRAM_ATTR countWaterPulses() { waterPulseCount++; }
 void IRAM_ATTR countOilPulses() { oilPulseCount++; }
+void IRAM_ATTR countOutPulses() { outPulseCount++; }
 
 // --- FINITE STATE MACHINE (FSM) ---
 enum SystemState {
   STATE_MAIN_SCREEN,
   STATE_MENU1_TOTAL_VOL,
-  STATE_MENU_LOCKED,       // Trava de Segurança para Parâmetros Críticos
+  STATE_MENU_LOCKED,
   STATE_MENU2_WATER_PCT,
-  STATE_MENU3_TARGET_BRIX, // Novo Menu: Porcentagem de Brix
+  STATE_MENU3_TARGET_BRIX, 
   STATE_MENU4_MOTOR_SPEED,
   STATE_MENU5_MIX_TIME,
   STATE_MENU6_PURGE,
   STATE_DOSING,
   STATE_MIXING,
+  STATE_DISPENSING,        // Estado de Envase
   STATE_QUALITY_CHECK,
   STATE_ERROR_HIGH_LEVEL
 };
@@ -103,39 +110,30 @@ const unsigned long DEBOUNCE_DELAY = 180; // ms
 // Brix Sensor Reading
 float currentBrixValue = 0.0;
 
-// --- AUDIO FEEDBACK FUNCTIONS (BIPS SUAVIZADOS) ---
+// --- AUDIO FEEDBACK FUNCTIONS ---
 void playSoftSound(int frequency, int durationMs) {
   tone(BUZZER_PIN, frequency, durationMs);
   delay(durationMs);
   noTone(BUZZER_PIN);
 }
 
-void playButtonBeep() {
-  playSoftSound(2200, 15); // Bip super curto e leve ao apertar botão
-}
-
-void playStartDosingBeep() {
-  playSoftSound(1500, 120); // Bip levemente mais esticado na arrancada do envase
-}
-
+void playButtonBeep() { playSoftSound(2200, 15); }
+void playStartDosingBeep() { playSoftSound(1500, 120); }
 void playApprovedBeep() {
   playSoftSound(1200, 40); 
   delay(20);
   playSoftSound(1600, 60); 
 }
-
 void playRejectedBeep() {
   playSoftSound(600, 150);  
   delay(30);
   playSoftSound(400, 200);  
 }
-
 void playStartupBeep() {
   playSoftSound(1800, 30);
   delay(30);
   playSoftSound(2200, 40);
 }
-
 void playErrorAlarm() {
   for (int i = 0; i < 3; i++) {
     playSoftSound(900, 100);
@@ -167,6 +165,7 @@ void readBrixSensor();
 void checkFloatSwitchSafety();
 void processDosing();
 void processMixing();
+void processDispensing();
 void startDosing();
 void stopProcess();
 void updateOLED();
@@ -182,11 +181,12 @@ void setup() {
 
   pinMode(SOLENOID_WATER_PIN, OUTPUT);
   pinMode(SOLENOID_OIL_PIN, OUTPUT);
+  pinMode(SOLENOID_DISPENSE_PIN, OUTPUT);
 
   digitalWrite(SOLENOID_WATER_PIN, LOW);
   digitalWrite(SOLENOID_OIL_PIN, LOW);
+  digitalWrite(SOLENOID_DISPENSE_PIN, LOW);
 
-  // Setup PWM Channel for ESP32
   #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
     ledcAttachChannel(MOTOR_PWM_PIN, PWM_FREQ, PWM_RESOLUTION, PWM_CHANNEL);
   #else
@@ -201,13 +201,16 @@ void setup() {
   pinMode(BTN_BLACK_PIN, INPUT_PULLUP);
   pinMode(BTN_BLUE_PIN, INPUT_PULLUP);
 
-  pinMode(FLOAT_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(FLOAT_SWITCH_HIGH_PIN, INPUT_PULLUP);
+  pinMode(FLOAT_SWITCH_LOW_PIN, INPUT_PULLUP);
   pinMode(WATER_FLOW_SENSOR_PIN, INPUT_PULLUP);
   pinMode(OIL_FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(OUT_FLOW_SENSOR_PIN, INPUT_PULLUP); // Pull-up para o sensor de fluxo novo
   pinMode(BRIX_SENSOR_PIN, INPUT);
 
   attachInterrupt(digitalPinToInterrupt(WATER_FLOW_SENSOR_PIN), countWaterPulses, FALLING);
   attachInterrupt(digitalPinToInterrupt(OIL_FLOW_SENSOR_PIN), countOilPulses, FALLING);
+  attachInterrupt(digitalPinToInterrupt(OUT_FLOW_SENSOR_PIN), countOutPulses, FALLING);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("Erro ao iniciar display OLED!"));
@@ -227,6 +230,8 @@ void loop() {
     processDosing();
   } else if (currentState == STATE_MIXING) {
     processMixing();
+  } else if (currentState == STATE_DISPENSING) {
+    processDispensing();
   } else {
     static unsigned long lastOLEDUpdate = 0;
     if (millis() - lastOLEDUpdate > 250) {
@@ -237,8 +242,8 @@ void loop() {
 }
 
 void checkFloatSwitchSafety() {
-  bool isHighLevelReached = (digitalRead(FLOAT_SWITCH_PIN) == HIGH);
-
+  // Transbordamento (Erro Crítico)
+  bool isHighLevelReached = (digitalRead(FLOAT_SWITCH_HIGH_PIN) == HIGH);
   if (isHighLevelReached && (currentState == STATE_DOSING || currentState == STATE_MIXING)) {
     stopProcess();
     currentState = STATE_ERROR_HIGH_LEVEL;
@@ -250,8 +255,6 @@ void checkFloatSwitchSafety() {
 void readBrixSensor() {
   static float filteredBrix = -1.0;
   int rawADC = analogRead(BRIX_SENSOR_PIN);
-  
-  // Escala expandida para até 40.0 Brix
   float instantBrix = (rawADC / 4095.0) * 40.0; 
   
   if (filteredBrix < 0) {
@@ -263,23 +266,20 @@ void readBrixSensor() {
 }
 
 void startDosing() {
-  if (digitalRead(FLOAT_SWITCH_PIN) == HIGH) {
+  if (digitalRead(FLOAT_SWITCH_HIGH_PIN) == HIGH) {
     currentState = STATE_ERROR_HIGH_LEVEL;
     playErrorAlarm();
     updateOLED();
     return;
   }
 
-  playStartDosingBeep(); // Bip um pouco mais esticado ao iniciar o envase
+  playStartDosingBeep();
 
   waterPulseCount = 0;
   oilPulseCount = 0;
-
   targetWaterVol = totalVolume * (waterPercentage / 100.0);
   targetOilVol = totalVolume - targetWaterVol;
-
   expectedTargetBrix = targetBrixPct;
-
   isWaterSolenoidActive = (targetWaterVol > 0);
   isOilSolenoidActive = (targetOilVol > 0);
 
@@ -287,7 +287,6 @@ void startDosing() {
   digitalWrite(SOLENOID_OIL_PIN, isOilSolenoidActive ? HIGH : LOW);
   stopMotorPWM();
   digitalWrite(LED_DOSING_PIN, HIGH);
-
   currentState = STATE_DOSING;
 }
 
@@ -299,7 +298,6 @@ void processDosing() {
     digitalWrite(SOLENOID_WATER_PIN, LOW);
     isWaterSolenoidActive = false;
   }
-
   if (isOilSolenoidActive && currentOilVol >= targetOilVol) {
     digitalWrite(SOLENOID_OIL_PIN, LOW);
     isOilSolenoidActive = false;
@@ -308,12 +306,10 @@ void processDosing() {
   if (!isWaterSolenoidActive && !isOilSolenoidActive) {
     digitalWrite(SOLENOID_WATER_PIN, LOW);
     digitalWrite(SOLENOID_OIL_PIN, LOW);
-    
     setMotorPWM(motorSpeedPct);
     mixingStartTime = millis();
     currentState = STATE_MIXING;
   }
-
   updateOLED();
 }
 
@@ -323,12 +319,34 @@ void processMixing() {
 
   if (elapsedTimeMs >= totalTargetTimeMs) {
     stopMotorPWM();
-    digitalWrite(LED_DOSING_PIN, LOW);
     
+    // Verifica o Brix assim que a mistura acaba
     finalMeasuredBrix = currentBrixValue;
     float brixError = abs(finalMeasuredBrix - expectedTargetBrix);
     isProductApproved = (brixError <= BRIX_TOLERANCE);
 
+    // Zera contador do novo sensor e abre solenóide 3
+    outPulseCount = 0;
+    digitalWrite(SOLENOID_DISPENSE_PIN, HIGH);
+    currentState = STATE_DISPENSING;
+  }
+  updateOLED();
+}
+
+void processDispensing() {
+  float currentDispensedVol = outPulseCount / PULSES_PER_LITER;
+  
+  // Condições de parada do envase:
+  bool volumeAtingido = (currentDispensedVol >= totalVolume);
+  
+  // Assumindo que a boia devolve HIGH quando o tanque está VAZIO. 
+  // (Caso sua boia trabalhe invertida, altere para == LOW)
+  bool tanqueVazio = (digitalRead(FLOAT_SWITCH_LOW_PIN) == HIGH); 
+
+  if (volumeAtingido || tanqueVazio) {
+    digitalWrite(SOLENOID_DISPENSE_PIN, LOW); // Fecha saída
+    digitalWrite(LED_DOSING_PIN, LOW);
+    
     currentState = STATE_QUALITY_CHECK;
 
     if (isProductApproved) {
@@ -337,13 +355,13 @@ void processMixing() {
       playRejectedBeep();
     }
   }
-
   updateOLED();
 }
 
 void stopProcess() {
   digitalWrite(SOLENOID_WATER_PIN, LOW);
   digitalWrite(SOLENOID_OIL_PIN, LOW);
+  digitalWrite(SOLENOID_DISPENSE_PIN, LOW); 
   stopMotorPWM();
   digitalWrite(LED_DOSING_PIN, LOW);
   noTone(BUZZER_PIN);
@@ -380,23 +398,12 @@ void processButtons() {
       tempMixingTimeSec = mixingTimeSec;
       currentState = STATE_MENU1_TOTAL_VOL;
     } 
-    else if (currentState == STATE_MENU1_TOTAL_VOL) {
-      currentState = STATE_MENU_LOCKED; // Solicita autorização técnica para acessar os menus de receita
-    }
-    else if (currentState == STATE_MENU2_WATER_PCT) {
-      currentState = STATE_MENU3_TARGET_BRIX;
-    }
-    else if (currentState == STATE_MENU3_TARGET_BRIX) {
-      currentState = STATE_MENU4_MOTOR_SPEED;
-    }
-    else if (currentState == STATE_MENU4_MOTOR_SPEED) {
-      currentState = STATE_MENU5_MIX_TIME;
-    }
-    else if (currentState == STATE_MENU5_MIX_TIME) {
-      currentState = STATE_MENU6_PURGE;
-    }
+    else if (currentState == STATE_MENU1_TOTAL_VOL) { currentState = STATE_MENU_LOCKED; }
+    else if (currentState == STATE_MENU2_WATER_PCT) { currentState = STATE_MENU3_TARGET_BRIX; }
+    else if (currentState == STATE_MENU3_TARGET_BRIX) { currentState = STATE_MENU4_MOTOR_SPEED; }
+    else if (currentState == STATE_MENU4_MOTOR_SPEED) { currentState = STATE_MENU5_MIX_TIME; }
+    else if (currentState == STATE_MENU5_MIX_TIME) { currentState = STATE_MENU6_PURGE; }
     else if (currentState == STATE_MENU6_PURGE) {
-      // Salva e retorna à tela principal
       totalVolume = tempTotalVolume;
       waterPercentage = tempWaterPercentage;
       targetBrixPct = tempTargetBrixPct;
@@ -409,12 +416,12 @@ void processButtons() {
     updateOLED();
   }
 
-  // BOTÃO AZUL: Desbloqueio do Modo Técnico / Incremento / Purga Solenoide A
+  // BOTÃO AZUL: Desbloqueio do Modo Técnico
   if (currentState == STATE_MENU_LOCKED) {
     if (currentBlueState == LOW && prevBlueState == HIGH) {
       lastButtonDebounce = millis();
       playButtonBeep();
-      currentState = STATE_MENU2_WATER_PCT; // Acesso liberado
+      currentState = STATE_MENU2_WATER_PCT; 
       updateOLED();
     }
   }
@@ -434,12 +441,8 @@ void processButtons() {
       digitalWrite(SOLENOID_OIL_PIN, LOW);
       currentState = STATE_MAIN_SCREEN;
     }
-    else if (currentState == STATE_MAIN_SCREEN) {
-      startDosing();
-    }
-    else if (currentState == STATE_QUALITY_CHECK) {
-      currentState = STATE_MAIN_SCREEN;
-    }
+    else if (currentState == STATE_MAIN_SCREEN) { startDosing(); }
+    else if (currentState == STATE_QUALITY_CHECK) { currentState = STATE_MAIN_SCREEN; }
     updateOLED();
   }
 
@@ -448,11 +451,12 @@ void processButtons() {
     lastButtonDebounce = millis();
     playButtonBeep();
 
-    if (currentState == STATE_DOSING || currentState == STATE_MIXING) {
+    if (currentState == STATE_DOSING || currentState == STATE_MIXING || currentState == STATE_DISPENSING) {
       stopProcess();
     } else {
       digitalWrite(SOLENOID_WATER_PIN, LOW);
       digitalWrite(SOLENOID_OIL_PIN, LOW);
+      digitalWrite(SOLENOID_DISPENSE_PIN, LOW);
       currentState = STATE_MAIN_SCREEN;
     }
     updateOLED();
@@ -460,13 +464,10 @@ void processButtons() {
 
   // BOTÃO PRETO: Decrementar (-) OU Purga Solenoide B (Óleo)
   if (currentState == STATE_MENU6_PURGE) {
-    if (currentBlackState == LOW) {
-      digitalWrite(SOLENOID_OIL_PIN, HIGH);
-    } else {
-      digitalWrite(SOLENOID_OIL_PIN, LOW);
-    }
+    if (currentBlackState == LOW) { digitalWrite(SOLENOID_OIL_PIN, HIGH); } 
+    else { digitalWrite(SOLENOID_OIL_PIN, LOW); }
   } 
-  else if (currentBlackState == LOW && prevBlackState == HIGH && currentState != STATE_DOSING && currentState != STATE_MIXING && currentState != STATE_QUALITY_CHECK) {
+  else if (currentBlackState == LOW && prevBlackState == HIGH && currentState != STATE_DOSING && currentState != STATE_MIXING && currentState != STATE_DISPENSING && currentState != STATE_QUALITY_CHECK) {
     lastButtonDebounce = millis();
     playButtonBeep();
 
@@ -495,13 +496,10 @@ void processButtons() {
 
   // BOTÃO AZUL: Incremento (+) OU Purga Solenoide A (Água)
   if (currentState == STATE_MENU6_PURGE) {
-    if (currentBlueState == LOW) {
-      digitalWrite(SOLENOID_WATER_PIN, HIGH);
-    } else {
-      digitalWrite(SOLENOID_WATER_PIN, LOW);
-    }
+    if (currentBlueState == LOW) { digitalWrite(SOLENOID_WATER_PIN, HIGH); } 
+    else { digitalWrite(SOLENOID_WATER_PIN, LOW); }
   } 
-  else if (currentBlueState == LOW && prevBlueState == HIGH && currentState != STATE_DOSING && currentState != STATE_MIXING && currentState != STATE_QUALITY_CHECK && currentState != STATE_MENU_LOCKED) {
+  else if (currentBlueState == LOW && prevBlueState == HIGH && currentState != STATE_DOSING && currentState != STATE_MIXING && currentState != STATE_DISPENSING && currentState != STATE_QUALITY_CHECK && currentState != STATE_MENU_LOCKED) {
     lastButtonDebounce = millis();
     playButtonBeep();
 
@@ -515,7 +513,7 @@ void processButtons() {
     } 
     else if (currentState == STATE_MENU3_TARGET_BRIX) {
       tempTargetBrixPct += 0.5;
-      if (tempTargetBrixPct > 40.0) tempTargetBrixPct = 40.0; // Limite ajustado para 40 Brix
+      if (tempTargetBrixPct > 40.0) tempTargetBrixPct = 40.0; 
     }
     else if (currentState == STATE_MENU4_MOTOR_SPEED) {
       tempMotorSpeedPct += 5;
@@ -583,7 +581,7 @@ void updateOLED() {
     case STATE_MENU2_WATER_PCT:
       display.setTextSize(1);
       display.setCursor(0, 0);
-      display.println(F("MENU 2/6: % AGUA (LADO A)"));
+      display.println(F("MENU 2/6: % AGUA"));
       display.setTextSize(2);
       display.setCursor(10, 20);
       display.printf("%.1f %%", tempWaterPercentage);
@@ -639,13 +637,13 @@ void updateOLED() {
     case STATE_MENU6_PURGE:
       display.setTextSize(1);
       display.setCursor(0, 0);
-      display.println(F("MENU 6/6: DESPEJO LIVRE"));
+      display.println(F("MENU 6/6: DESPEJO"));
       display.setCursor(0, 18);
       display.println(F("Segure p/ Acionar:"));
       display.setCursor(0, 32);
-      display.println(F("[AZUL]  Solenoide Agua"));
+      display.println(F("[AZUL]  Agua"));
       display.setCursor(0, 44);
-      display.println(F("[PRETO] Solenoide Oleo"));
+      display.println(F("[PRETO] Oleo"));
       display.setCursor(0, 55);
       display.println(F("[VERDE] Sair"));
       break;
@@ -653,70 +651,75 @@ void updateOLED() {
     case STATE_DOSING: {
       float currentWaterVol = waterPulseCount / PULSES_PER_LITER;
       float currentOilVol = oilPulseCount / PULSES_PER_LITER;
-
       display.setTextSize(1);
       display.setCursor(0, 0);
-      display.println(F("  >>> DOSANDO... <<<  "));
-      display.setCursor(0, 16);
-      display.printf("AGUA: %.2f/%.2f L\n", currentWaterVol, targetWaterVol);
-      display.printf("OLEO: %.2f/%.2f L\n", currentOilVol, targetOilVol);
-      display.setCursor(0, 36);
-      display.printf("Brix Instant: %.1f Bx\n", currentBrixValue);
-      display.setCursor(0, 48);
-      if (isWaterSolenoidActive && isOilSolenoidActive) display.println(F("Solenoides: AMBAS"));
-      else if (isWaterSolenoidActive) display.println(F("Sol: Apenas AGUA"));
-      else if (isOilSolenoidActive) display.println(F("Sol: Apenas OLEO"));
-      else display.println(F("Solenoides: FECHADAS"));
+      display.println(F(">> DOSANDO PRODUTO <<"));
+      display.setCursor(0, 20);
+      display.printf("Agua: %.2f/%.2f L\n", currentWaterVol, targetWaterVol);
+      display.setCursor(0, 35);
+      display.printf("Oleo: %.2f/%.2f L\n", currentOilVol, targetOilVol);
+      display.setCursor(0, 55);
+      display.println(F("[VERMELHO] Abortar"));
       break;
     }
 
     case STATE_MIXING: {
-      unsigned long elapsedTimeSec = (millis() - mixingStartTime) / 1000;
-      int timeRemainingSec = mixingTimeSec - (int)elapsedTimeSec;
-      if (timeRemainingSec < 0) timeRemainingSec = 0;
-      
+      unsigned long elapsedSec = (millis() - mixingStartTime) / 1000;
       display.setTextSize(1);
       display.setCursor(0, 0);
-      display.println(F(" >> MISTURANDO... << "));
-      display.setCursor(0, 18);
+      display.println(F(">> MISTURANDO... <<"));
       display.setTextSize(2);
-      display.printf("  %d s", timeRemainingSec);
+      display.setCursor(20, 25);
+      display.printf("%lu / %d s", elapsedSec, mixingTimeSec);
       display.setTextSize(1);
-      display.setCursor(0, 42);
-      display.printf("Brix Instant: %.1f Bx\n", currentBrixValue);
-      display.setCursor(0, 54);
-      display.printf("Motor Potencia: %d%%\n", motorSpeedPct);
+      display.setCursor(0, 55);
+      display.println(F("[VERMELHO] Abortar"));
+      break;
+    }
+
+    case STATE_DISPENSING: {
+      float currentDispensedVol = outPulseCount / PULSES_PER_LITER;
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println(F(">> ENVASANDO... <<"));
+      display.setTextSize(2);
+      display.setCursor(10, 25);
+      display.printf("%.2f/%.2f L", currentDispensedVol, totalVolume);
+      display.setTextSize(1);
+      display.setCursor(0, 55);
+      display.println(F("[VERMELHO] Abortar"));
       break;
     }
 
     case STATE_QUALITY_CHECK:
       display.setTextSize(1);
       display.setCursor(0, 0);
-      display.println(F("-- TESTE DE QUALIDADE --"));
-      display.setCursor(0, 14);
-      display.printf("Brix Alvo: %.1f degBrix\n", expectedTargetBrix);
-      display.printf("Brix Lido: %.1f degBrix\n", finalMeasuredBrix);
-      display.setCursor(0, 36);
+      display.println(F("--- RESULTADO ---"));
+      display.setCursor(0, 15);
+      display.printf("Alvo : %.1f Bx\n", expectedTargetBrix);
+      display.printf("Final: %.1f Bx\n", finalMeasuredBrix);
+      
+      display.setCursor(0, 40);
       if (isProductApproved) {
-        display.println(F("STATUS: [ APROVADO ]"));
+        display.println(F("STATUS: APROVADO !"));
       } else {
-        display.println(F("STATUS: [ REPROVADO ]"));
+        display.println(F("STATUS: REPROVADO !"));
       }
-      display.setCursor(0, 54);
-      display.println(F("[VERDE] Concluir Batch"));
+      display.setCursor(0, 55);
+      display.println(F("[VERDE] Voltar"));
       break;
 
     case STATE_ERROR_HIGH_LEVEL:
       display.setTextSize(1);
       display.setCursor(0, 0);
-      display.println(F("! ALARME SEGURANCA !"));
+      display.println(F("!! ERRO FATAL !!"));
       display.setCursor(0, 20);
-      display.println(F(" RESERVATORIO CHEIO "));
-      display.println(F("   BOIA ACIONADA!   "));
-      display.setCursor(0, 54);
+      display.println(F("Nivel Alto Atingido"));
+      display.setCursor(0, 35);
+      display.println(F("Processo Abortado."));
+      display.setCursor(0, 55);
       display.println(F("[VERMELHO] Resetar"));
       break;
   }
-
   display.display();
 }
